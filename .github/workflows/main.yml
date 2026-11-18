@@ -151,8 +151,6 @@ jobs:
               exit 1
           }
           $hostname = "gh-runner-$env:GITHUB_RUN_ID"
-          
-          # CATATAN: Flag --ssh dihilangkan karena tidak didukung di Windows.
           $tsArgs = @("up", "--authkey=$env:TS_AUTHKEY", "--hostname=$hostname", "--accept-routes")
           & "$env:ProgramFiles\Tailscale\tailscale.exe" @tsArgs
 
@@ -181,26 +179,56 @@ jobs:
           if (-not $ok) { Write-Error "Koneksi TCP 3389 gagal."; exit 1 }
           Write-Host "RDP port 3389 OK."
 
-      # ---------- INSTALL GIT BASH ----------
-      - name: Install Git Bash (Git for Windows)
+      # ---------- INSTALL GIT BASH (+ GIT BASH HERE) ----------
+      - name: Install Git Bash (with Context Menu)
         shell: powershell
         run: |
+          # 1. Matikan sementara Windows Defender agar tidak "hang" saat instalasi
+          try {
+              Set-MpPreference -DisableRealtimeMonitoring $true -ErrorAction SilentlyContinue
+              Write-Host "Windows Defender real-time monitoring dimatikan sementara."
+          } catch {}
+
           $gitUrl = "https://github.com/git-for-windows/git/releases/download/v2.45.2.windows.1/Git-2.45.2-64-bit.exe"
           $installer = "$env:TEMP\git-installer.exe"
-          Invoke-WebRequest -Uri $gitUrl -OutFile $installer -UseBasicParsing
-          Start-Process -FilePath $installer -ArgumentList `
-              "/VERYSILENT","/NORESTART","/NOCANCEL","/SP-", `
-              "/COMPONENTS=`"git,gitbash,gitbashhere`"", `
-              "/o:PathOption=Cmd" -Wait
-          Remove-Item $installer -Force
           
+          Write-Host "Mengunduh Git Installer..."
+          Invoke-WebRequest -Uri $gitUrl -OutFile $installer -UseBasicParsing
+
+          Write-Host "Menjalankan instalasi (mode senyap)..."
+          # 2. Jalankan proses instalasi
+          $proc = Start-Process -FilePath $installer -ArgumentList `
+              "/VERYSILENT","/NORESTART","/NOCANCEL","/SP-", `
+              "/COMPONENTS=`"git,gitbash,gitbashhere,icons,ext,shell`"", `
+              "/o:PathOption=Cmd" -PassThru
+
+          # 3. Tunggu maksimal 2 menit. Jika lebih, bunuh prosesnya (paksa selesai)
+          $finished = $proc.WaitForExit(120000)
+          if (-not $finished) {
+              Write-Host "⚠️ Instalasi memakan waktu > 2 menit, memaksa menutup proses..."
+              Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+              Start-Sleep -Seconds 5
+          } else {
+              Write-Host "✅ Instalasi selesai dalam batas waktu."
+          }
+          
+          Remove-Item $installer -Force -ErrorAction SilentlyContinue
+
+          # 4. Nyalakan kembali Windows Defender
+          try {
+              Set-MpPreference -DisableRealtimeMonitoring $false -ErrorAction SilentlyContinue
+              Write-Host "Windows Defender real-time monitoring dinyalakan kembali."
+          } catch {}
+
+          # 5. Verifikasi
           $gitBash = "C:\Program Files\Git\bin\bash.exe"
           if (-not (Test-Path $gitBash)) {
-              Write-Error "Git Bash tidak terpasang."
+              Write-Error "Git Bash tidak ditemukan setelah instalasi."
               exit 1
           }
+          
           "GITBASH_EXE=$gitBash" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          Write-Host "Git Bash terpasang di $gitBash"
+          Write-Host "Git Bash dan Context Menu (Git Bash Here) siap digunakan."
 
       # ---------- (OPSIONAL) JALANKAN SCRIPT EKSTERNAL ----------
       - name: Run Optional External Script
