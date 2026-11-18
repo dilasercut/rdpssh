@@ -281,12 +281,14 @@ jobs:
           $bash = $env:GITBASH_EXE
           while ($true) {
               $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-              Write-Host "[$ts] Aktif — IP: $env:TAILSCALE_IP"
+              Write-Host "[$ts] Aktif - IP: $env:TAILSCALE_IP"
               if ($bash -and (Test-Path $bash)) {
                   try {
-                      $out = & $bash -lc "echo Bash OK: \$(uname -a) | cut -c1-80" 2>&1
+                      $out = & $bash -lc "echo Bash OK: `$(uname -a) | cut -c1-80" 2>&1
                       Write-Host "  Git Bash: $out"
-                  } catch { Write-Host "  Git Bash error: $($_.Exception.Message)" }
+                  } catch {
+                      Write-Host "  Git Bash error: $($_.Exception.Message)"
+                  }
               }
               Start-Sleep -Seconds 300
           }
