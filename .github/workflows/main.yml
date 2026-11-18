@@ -1,0 +1,284 @@
+name: Windows RDP + SSH + Git Bash via Tailscale (Secure)
+
+on:
+  workflow_dispatch:
+    inputs:
+      enable_rdp:
+        description: 'Aktifkan RDP (true/false)'
+        required: true
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+      enable_ssh:
+        description: 'Aktifkan Tailscale SSH (true/false)'
+        required: true
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+      run_script_url:
+        description: 'URL script .bat/.ps1 opsional (kosongkan jika tidak perlu)'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rdp-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  secure-remote:
+    runs-on: windows-2022
+    timeout-minutes: 350
+
+    steps:
+      # ---------- CLEANUP SELALU DIJALANKAN ----------
+      - name: Cleanup (always)
+        if: always()
+        shell: powershell
+        run: |
+          Write-Host "=== Cleanup: Tailscale logout & hapus user RDP ==="
+          $tsExe = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          if (Test-Path $tsExe) {
+              try { & $tsExe set --ssh=false 2>$null } catch { }
+              try { & $tsExe logout 2>$null } catch { }
+              try { & $tsExe down   2>$null } catch { }
+          }
+          try {
+              $u = Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue
+              if ($u) {
+                  Remove-LocalGroupMember -Group "Administrators"        -Member "RDP" -ErrorAction SilentlyContinue
+                  Remove-LocalGroupMember -Group "Remote Desktop Users"  -Member "RDP" -ErrorAction SilentlyContinue
+                  Remove-LocalUser -Name "RDP" -ErrorAction SilentlyContinue
+                  Write-Host "User RDP dihapus."
+              }
+          } catch { Write-Host "Cleanup user: $($_.Exception.Message)" }
+
+      # ---------- KONFIGURASI RDP (AMAN) ----------
+      - name: Configure RDP (NLA ON)
+        if: ${{ inputs.enable_rdp == 'true' }}
+        shell: powershell
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                           -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                           -Name "UserAuthentication" -Value 1 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                           -Name "SecurityLayer" -Value 2 -Force
+
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" | Out-Null
+          netsh advfirewall firewall add rule name="RDP-Tailscale" `
+            dir=in action=allow protocol=TCP localport=3389
+
+          Restart-Service -Name TermService -Force
+          Write-Host "RDP dikonfigurasi dengan NLA aktif."
+
+      # ---------- USER RDP DENGAN PASSWORD DARI SECRETS ----------
+      - name: Create RDP User (secure password)
+        if: ${{ inputs.enable_rdp == 'true' }}
+        shell: powershell
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          if (-not $env:RDP_PASSWORD) {
+              Write-Error "Secret RDP_PASSWORD belum diset."
+              exit 1
+          }
+          $securePass = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
+          $existing = Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue
+          if (-not $existing) {
+              New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires -PasswordNeverExpires | Out-Null
+          } else {
+              Set-LocalUser -Name "RDP" -Password $securePass
+          }
+          foreach ($g in @("Administrators","Remote Desktop Users")) {
+              $members = Get-LocalGroupMember -Group $g -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name
+              if ($members -notcontains "$env:COMPUTERNAME\RDP") {
+                  Add-LocalGroupMember -Group $g -Member "RDP" -ErrorAction SilentlyContinue
+              }
+          }
+          if (-not (Get-LocalUser -Name "RDP")) {
+              Write-Error "Pembuatan user gagal."
+              exit 1
+          }
+          Write-Host "User RDP siap. (Password TIDAK dicetak ke log.)"
+
+      # ---------- INSTALL TAILSCALE ----------
+      - name: Install Tailscale
+        shell: powershell
+        run: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath -UseBasicParsing
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
+          Write-Host "Tailscale terpasang."
+
+      # ---------- KONEKSI TAILSCALE (+ SSH JIKA DIAKTIFKAN) ----------
+      - name: Establish Tailscale Connection
+        shell: powershell
+        env:
+          TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+          ENABLE_SSH: ${{ inputs.enable_ssh }}
+        run: |
+          if (-not $env:TS_AUTHKEY) {
+              Write-Error "Secret TAILSCALE_AUTHKEY belum diset."
+              exit 1
+          }
+          $hostname = "gh-runner-$env:GITHUB_RUN_ID"
+          $tsArgs = @("up", "--authkey=$env:TS_AUTHKEY", "--hostname=$hostname", "--accept-routes")
+
+          # Aktifkan Tailscale SSH jika diminta
+          if ($env:ENABLE_SSH -eq 'true') {
+              $tsArgs += "--ssh"
+              Write-Host "Tailscale SSH akan diaktifkan."
+          }
+
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" @tsArgs
+
+          $tsIP = $null; $retries = 0
+          while (-not $tsIP -and $retries -lt 12) {
+              $tsIP = (& "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4) 2>$null
+              if (-not $tsIP) { Start-Sleep -Seconds 5; $retries++ }
+          }
+          if (-not $tsIP) { Write-Error "Tailscale IP tidak didapat."; exit 1 }
+          "TAILSCALE_IP=$tsIP" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "Tailscale IP: $tsIP"
+
+          # Verifikasi SSH advertised
+          if ($env:ENABLE_SSH -eq 'true') {
+              $status = & "$env:ProgramFiles\Tailscale\tailscale.exe" status --json | ConvertFrom-Json
+              $self = $status.Self
+              if ($self -and $self.SSH_HostKeys) {
+                  Write-Host "✅ Tailscale SSH aktif (host keys terdeteksi)."
+              } else {
+                  Write-Host "⚠️  Tailscale SSH mungkin belum aktif. Cek policy Tailscale."
+              }
+          }
+
+      # ---------- VERIFIKASI RDP ----------
+      - name: Verify RDP Accessibility
+        if: ${{ inputs.enable_rdp == 'true' }}
+        shell: powershell
+        run: |
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+          $ok = $false
+          for ($i=0; $i -lt 6; $i++) {
+              $r = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389 -WarningAction SilentlyContinue
+              if ($r.TcpTestSucceeded) { $ok = $true; break }
+              Start-Sleep -Seconds 10
+          }
+          if (-not $ok) { Write-Error "Koneksi TCP 3389 gagal."; exit 1 }
+          Write-Host "RDP port 3389 OK."
+
+      # ---------- INSTALL GIT BASH ----------
+      - name: Install Git Bash (Git for Windows)
+        shell: powershell
+        run: |
+          $gitUrl = "https://github.com/git-for-windows/git/releases/download/v2.45.2.windows.1/Git-2.45.2-64-bit.exe"
+          $installer = "$env:TEMP\git-installer.exe"
+          Invoke-WebRequest -Uri $gitUrl -OutFile $installer -UseBasicParsing
+          Start-Process -FilePath $installer -ArgumentList `
+              "/VERYSILENT","/NORESTART","/NOCANCEL","/SP-", `
+              "/COMPONENTS=`"git,gitbash,gitbashhere`"", `
+              "/o:PathOption=Cmd" -Wait
+          Remove-Item $installer -Force
+          $gitBash = "C:\Program Files\Git\bin\bash.exe"
+          if (-not (Test-Path $gitBash)) {
+              Write-Error "Git Bash tidak terpasang."
+              exit 1
+          }
+          "GITBASH_EXE=$gitBash" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "Git Bash terpasang di $gitBash"
+
+      # ---------- SETUP USER UNTUK TAILSCALE SSH ----------
+      - name: Setup SSH User for Tailscale SSH
+        if: ${{ inputs.enable_ssh == 'true' }}
+        shell: powershell
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          # Tailscale SSH memerlukan user lokal yang ada di host.
+          # Kita gunakan user "RDP" yang sudah dibuat (jika RDP aktif),
+          # atau buat user "sshuser" jika RDP tidak aktif.
+          $sshUser = if (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue) { "RDP" } else { "sshuser" }
+
+          if ($sshUser -eq "sshuser" -and -not (Get-LocalUser -Name "sshuser" -ErrorAction SilentlyContinue)) {
+              if (-not $env:RDP_PASSWORD) {
+                  Write-Error "Secret RDP_PASSWORD diperlukan untuk membuat user SSH."
+                  exit 1
+              }
+              $securePass = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
+              New-LocalUser -Name "sshuser" -Password $securePass -AccountNeverExpires -PasswordNeverExpires | Out-Null
+              Add-LocalGroupMember -Group "Administrators" -Member "sshuser" -ErrorAction SilentlyContinue
+              Write-Host "User sshuser dibuat untuk Tailscale SSH."
+          }
+
+          "SSH_USER=$sshUser" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "Tailscale SSH akan menggunakan user: $sshUser"
+
+      # ---------- (OPSIONAL) JALANKAN SCRIPT EKSTERNAL ----------
+      - name: Run Optional External Script
+        if: ${{ inputs.run_script_url != '' }}
+        shell: powershell
+        env:
+          SCRIPT_URL: ${{ inputs.run_script_url }}
+        run: |
+          if (-not $env:SCRIPT_URL) { Write-Host "Tidak ada script."; exit 0 }
+          $name = Split-Path $env:SCRIPT_URL -Leaf
+          $dest = Join-Path $env:TEMP $name
+          Write-Host "Mengunduh: $env:SCRIPT_URL"
+          Invoke-WebRequest -Uri $env:SCRIPT_URL -OutFile $dest -UseBasicParsing
+          $sha = (Get-FileHash $dest -Algorithm SHA256).Hash
+          Write-Host "SHA256: $sha"
+          Write-Host "⚠️  Script dijalankan dengan hak Administrator."
+          if ($dest -match '\.ps1$') { & powershell.exe -ExecutionPolicy Bypass -File $dest }
+          elseif ($dest -match '\.bat$|\.cmd$') { cmd /c $dest }
+          else { Write-Error "Ekstensi script tidak didukung."; exit 1 }
+
+      # ---------- INFORMASI AKSES ----------
+      - name: Print Access Info
+        shell: powershell
+        run: |
+          Write-Host "`n=== REMOTE ACCESS ==="
+          Write-Host "Tailscale IP : $env:TAILSCALE_IP"
+          Write-Host "Hostname     : gh-runner-$env:GITHUB_RUN_ID"
+
+          if ("${{ inputs.enable_rdp }}" -eq 'true') {
+              Write-Host "`n--- RDP ---"
+              Write-Host "Address  : $env:TAILSCALE_IP:3389"
+              Write-Host "Username : RDP"
+              Write-Host "Password : (secret RDP_PASSWORD)"
+          }
+
+          if ("${{ inputs.enable_ssh }}" -eq 'true') {
+              Write-Host "`n--- Tailscale SSH ---"
+              Write-Host "Command  : ssh $env:SSH_USER@$env:TAILSCALE_IP"
+              Write-Host "Atau     : ssh $env:SSH_USER@gh-runner-$env:GITHUB_RUN_ID"
+              Write-Host "Auth     : Otomatis via Tailscale (tanpa password/key)"
+          }
+
+          Write-Host "`nGit Bash : $env:GITBASH_EXE"
+          Write-Host "=====================`n"
+
+      # ---------- KEEP ALIVE + BASH HEARTBEAT ----------
+      - name: Keep Alive + Bash Heartbeat
+        shell: powershell
+        run: |
+          $bash = $env:GITBASH_EXE
+          while ($true) {
+              $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+              Write-Host "[$ts] Aktif — IP: $env:TAILSCALE_IP"
+              if ($bash -and (Test-Path $bash)) {
+                  try {
+                      $out = & $bash -lc "echo Bash OK: \$(uname -a) | cut -c1-80" 2>&1
+                      Write-Host "  Git Bash: $out"
+                  } catch { Write-Host "  Git Bash error: $($_.Exception.Message)" }
+              }
+              Start-Sleep -Seconds 300
+          }
