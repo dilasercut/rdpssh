@@ -12,7 +12,7 @@ on:
           - 'true'
           - 'false'
       enable_ssh:
-        description: 'Aktifkan Tailscale SSH (true/false)'
+        description: 'Aktifkan SSH (true/false)'
         required: true
         default: 'true'
         type: choice
@@ -28,7 +28,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: rdp-${{ github.ref }}
+  group: remote-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -42,10 +42,9 @@ jobs:
         if: always()
         shell: powershell
         run: |
-          Write-Host "=== Cleanup: Tailscale logout & hapus user RDP ==="
+          Write-Host "=== Cleanup: Tailscale logout & hapus user ==="
           $tsExe = "$env:ProgramFiles\Tailscale\tailscale.exe"
           if (Test-Path $tsExe) {
-              try { & $tsExe set --ssh=false 2>$null } catch { }
               try { & $tsExe logout 2>$null } catch { }
               try { & $tsExe down   2>$null } catch { }
           }
@@ -59,7 +58,7 @@ jobs:
               }
           } catch { Write-Host "Cleanup user: $($_.Exception.Message)" }
 
-      # ---------- KONFIGURASI RDP (AMAN) ----------
+      # ---------- KONFIGURASI RDP ----------
       - name: Configure RDP (NLA ON)
         if: ${{ inputs.enable_rdp == 'true' }}
         shell: powershell
@@ -78,9 +77,29 @@ jobs:
           Restart-Service -Name TermService -Force
           Write-Host "RDP dikonfigurasi dengan NLA aktif."
 
-      # ---------- USER RDP DENGAN PASSWORD DARI SECRETS ----------
-      - name: Create RDP User (secure password)
-        if: ${{ inputs.enable_rdp == 'true' }}
+      # ---------- INSTALL OPENSSH SERVER ----------
+      - name: Install and Configure OpenSSH Server
+        if: ${{ inputs.enable_ssh == 'true' }}
+        shell: powershell
+        run: |
+          Write-Host "Menginstal OpenSSH Server..."
+          $cap = Get-WindowsCapability -Online | Where-Object Name -like 'OpenSSH.Server*'
+          if ($cap.State -ne 'Installed') {
+              Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0
+          }
+          Start-Service sshd
+          Set-Service -Name sshd -StartupType Automatic
+
+          if (-not (Get-NetFirewallRule -Name "OpenSSH-Server-In-TCP" -ErrorAction SilentlyContinue)) {
+              New-NetFirewallRule -Name "OpenSSH-Server-In-TCP" `
+                  -DisplayName "OpenSSH Server (sshd)" `
+                  -Enabled True -Direction Inbound -Protocol TCP `
+                  -Action Allow -LocalPort 22
+          }
+          Write-Host "OpenSSH Server aktif di port 22."
+
+      # ---------- USER DENGAN PASSWORD DARI SECRETS ----------
+      - name: Create User (secure password)
         shell: powershell
         env:
           RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
@@ -96,12 +115,14 @@ jobs:
           } else {
               Set-LocalUser -Name "RDP" -Password $securePass
           }
+          
           foreach ($g in @("Administrators","Remote Desktop Users")) {
               $members = Get-LocalGroupMember -Group $g -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name
               if ($members -notcontains "$env:COMPUTERNAME\RDP") {
                   Add-LocalGroupMember -Group $g -Member "RDP" -ErrorAction SilentlyContinue
               }
           }
+          
           if (-not (Get-LocalUser -Name "RDP")) {
               Write-Error "Pembuatan user gagal."
               exit 1
@@ -119,26 +140,20 @@ jobs:
           Remove-Item $installerPath -Force
           Write-Host "Tailscale terpasang."
 
-      # ---------- KONEKSI TAILSCALE (+ SSH JIKA DIAKTIFKAN) ----------
+      # ---------- KONEKSI TAILSCALE ----------
       - name: Establish Tailscale Connection
         shell: powershell
         env:
           TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
-          ENABLE_SSH: ${{ inputs.enable_ssh }}
         run: |
           if (-not $env:TS_AUTHKEY) {
               Write-Error "Secret TAILSCALE_AUTHKEY belum diset."
               exit 1
           }
           $hostname = "gh-runner-$env:GITHUB_RUN_ID"
+          
+          # CATATAN: Flag --ssh dihilangkan karena tidak didukung di Windows.
           $tsArgs = @("up", "--authkey=$env:TS_AUTHKEY", "--hostname=$hostname", "--accept-routes")
-
-          # Aktifkan Tailscale SSH jika diminta
-          if ($env:ENABLE_SSH -eq 'true') {
-              $tsArgs += "--ssh"
-              Write-Host "Tailscale SSH akan diaktifkan."
-          }
-
           & "$env:ProgramFiles\Tailscale\tailscale.exe" @tsArgs
 
           $tsIP = $null; $retries = 0
@@ -147,19 +162,9 @@ jobs:
               if (-not $tsIP) { Start-Sleep -Seconds 5; $retries++ }
           }
           if (-not $tsIP) { Write-Error "Tailscale IP tidak didapat."; exit 1 }
+          
           "TAILSCALE_IP=$tsIP" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           Write-Host "Tailscale IP: $tsIP"
-
-          # Verifikasi SSH advertised
-          if ($env:ENABLE_SSH -eq 'true') {
-              $status = & "$env:ProgramFiles\Tailscale\tailscale.exe" status --json | ConvertFrom-Json
-              $self = $status.Self
-              if ($self -and $self.SSH_HostKeys) {
-                  Write-Host "✅ Tailscale SSH aktif (host keys terdeteksi)."
-              } else {
-                  Write-Host "⚠️  Tailscale SSH mungkin belum aktif. Cek policy Tailscale."
-              }
-          }
 
       # ---------- VERIFIKASI RDP ----------
       - name: Verify RDP Accessibility
@@ -188,6 +193,7 @@ jobs:
               "/COMPONENTS=`"git,gitbash,gitbashhere`"", `
               "/o:PathOption=Cmd" -Wait
           Remove-Item $installer -Force
+          
           $gitBash = "C:\Program Files\Git\bin\bash.exe"
           if (-not (Test-Path $gitBash)) {
               Write-Error "Git Bash tidak terpasang."
@@ -195,32 +201,6 @@ jobs:
           }
           "GITBASH_EXE=$gitBash" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           Write-Host "Git Bash terpasang di $gitBash"
-
-      # ---------- SETUP USER UNTUK TAILSCALE SSH ----------
-      - name: Setup SSH User for Tailscale SSH
-        if: ${{ inputs.enable_ssh == 'true' }}
-        shell: powershell
-        env:
-          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
-        run: |
-          # Tailscale SSH memerlukan user lokal yang ada di host.
-          # Kita gunakan user "RDP" yang sudah dibuat (jika RDP aktif),
-          # atau buat user "sshuser" jika RDP tidak aktif.
-          $sshUser = if (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue) { "RDP" } else { "sshuser" }
-
-          if ($sshUser -eq "sshuser" -and -not (Get-LocalUser -Name "sshuser" -ErrorAction SilentlyContinue)) {
-              if (-not $env:RDP_PASSWORD) {
-                  Write-Error "Secret RDP_PASSWORD diperlukan untuk membuat user SSH."
-                  exit 1
-              }
-              $securePass = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
-              New-LocalUser -Name "sshuser" -Password $securePass -AccountNeverExpires -PasswordNeverExpires | Out-Null
-              Add-LocalGroupMember -Group "Administrators" -Member "sshuser" -ErrorAction SilentlyContinue
-              Write-Host "User sshuser dibuat untuk Tailscale SSH."
-          }
-
-          "SSH_USER=$sshUser" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          Write-Host "Tailscale SSH akan menggunakan user: $sshUser"
 
       # ---------- (OPSIONAL) JALANKAN SCRIPT EKSTERNAL ----------
       - name: Run Optional External Script
@@ -257,10 +237,10 @@ jobs:
           }
 
           if ("${{ inputs.enable_ssh }}" -eq 'true') {
-              Write-Host "`n--- Tailscale SSH ---"
-              Write-Host "Command  : ssh $env:SSH_USER@$env:TAILSCALE_IP"
-              Write-Host "Atau     : ssh $env:SSH_USER@gh-runner-$env:GITHUB_RUN_ID"
-              Write-Host "Auth     : Otomatis via Tailscale (tanpa password/key)"
+              Write-Host "`n--- OpenSSH ---"
+              Write-Host "Command  : ssh RDP@$env:TAILSCALE_IP"
+              Write-Host "Atau     : ssh RDP@gh-runner-$env:GITHUB_RUN_ID"
+              Write-Host "Auth     : Password (secret RDP_PASSWORD)"
           }
 
           Write-Host "`nGit Bash : $env:GITBASH_EXE"
